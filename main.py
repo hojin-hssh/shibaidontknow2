@@ -1,114 +1,97 @@
 import cv2
 import numpy as np
-import onnxruntime as ort
-import argparse
+from insightface.app import FaceAnalysis
 
-# ==============================
-# CLI
-# ==============================
-parser = argparse.ArgumentParser(
-    description="Blur specific face using YOLO + Face Embedding (NO dlib)"
+# =====================
+# 설정
+# =====================
+INPUT_VIDEO = "res\\input.mp4"
+OUTPUT_VIDEO = "output_blur.mp4"
+TARGET_IMAGE = "res\\target.jpg"
+
+SIM_THRESHOLD = 0.4      # 이 값 이상이면 같은 사람
+BLUR_KERNEL = (51, 51)   # 블러 강도 (홀수만 가능)
+
+# =====================
+# InsightFace 초기화
+# =====================
+app = FaceAnalysis(
+    name="buffalo_l",
+    providers=["CPUExecutionProvider"]
 )
-parser.add_argument("video")
-parser.add_argument("--target", required=True)
-parser.add_argument("--yolo", default="yolov8n-face.onnx")
-parser.add_argument("--embed", default="arcface_r100.onnx")
-parser.add_argument("-o", "--output", default="output.mp4")
-parser.add_argument("--threshold", type=float, default=1.0)
-parser.add_argument("--padding", type=float, default=0.3)
-args = parser.parse_args()
+app.prepare(ctx_id=0, det_size=(640, 640))
 
-# ==============================
-# 모델 로드
-# ==============================
-yolo = ort.InferenceSession(args.yolo, providers=["CPUExecutionProvider"])
-embedder = ort.InferenceSession(args.embed, providers=["CPUExecutionProvider"])
+# =====================
+# Target embedding
+# =====================
+target_img = cv2.imread(TARGET_IMAGE)
+target_faces = app.get(target_img)
 
-# ==============================
-# 얼굴 임베딩 함수
-# ==============================
-def get_embedding(face):
-    face = cv2.resize(face, (112, 112))
-    face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
-    face = face.astype(np.float32) / 255.0
-    face = np.transpose(face, (2, 0, 1))
-    face = np.expand_dims(face, axis=0)
+if len(target_faces) == 0:
+    raise RuntimeError("❌ target.jpg에서 얼굴을 찾지 못함")
 
-    emb = embedder.run(None, {embedder.get_inputs()[0].name: face})[0]
-    emb = emb / np.linalg.norm(emb)
-    return emb[0]
+target_emb = target_faces[0].embedding
+target_emb = target_emb / np.linalg.norm(target_emb)  # ⭐ L2 normalize
 
-# ==============================
-# 타겟 얼굴 임베딩
-# ==============================
-target_img = cv2.imread(args.target)
-target_emb = get_embedding(target_img)
+# =====================
+# 비디오 입출력 설정
+# =====================
+cap = cv2.VideoCapture(INPUT_VIDEO)
 
-# ==============================
-# 비디오 준비
-# ==============================
-cap = cv2.VideoCapture(args.video)
+if not cap.isOpened():
+    raise RuntimeError("❌ 입력 영상 열기 실패")
+
+fps = cap.get(cv2.CAP_PROP_FPS)
 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps = cap.get(cv2.CAP_PROP_FPS)
 
-out = cv2.VideoWriter(
-    args.output,
-    cv2.VideoWriter_fourcc(*"mp4v"),
-    fps,
-    (w, h)
-)
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+out = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (w, h))
 
-# ==============================
+# =====================
 # 메인 루프
-# ==============================
-while cap.isOpened():
+# =====================
+frame_idx = 0
+
+while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    blob = cv2.resize(frame, (640, 640))
-    blob = blob.astype(np.float32) / 255.0
-    blob = np.transpose(blob, (2, 0, 1))
-    blob = np.expand_dims(blob, axis=0)
+    faces = app.get(frame)
 
-    preds = yolo.run(None, {yolo.get_inputs()[0].name: blob})[0][0]
+    for face in faces:
+        emb = face.embedding
+        emb = emb / np.linalg.norm(emb)  # ⭐ L2 normalize
 
-    for det in preds:
-        conf = det[4]
-        if conf < 0.5:
-            continue
+        sim = np.dot(emb, target_emb)
 
-        cx, cy, bw, bh = det[:4]
-        x1 = int((cx - bw / 2) * w / 640)
-        y1 = int((cy - bh / 2) * h / 640)
-        x2 = int((cx + bw / 2) * w / 640)
-        y2 = int((cy + bh / 2) * h / 640)
+        if sim > SIM_THRESHOLD:
+            x1, y1, x2, y2 = map(int, face.bbox)
 
-        face = frame[y1:y2, x1:x2]
+            # 안전 클램프
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(w, x2)
+            y2 = min(h, y2)
 
-        if face.size == 0:
-            continue
+            roi = frame[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
 
-        emb = get_embedding(face)
-        dist = np.linalg.norm(emb - target_emb)
-
-        # ==============================
-        # 🔥 특정 얼굴만 블러
-        # ==============================
-        if dist < args.threshold:
-            pad = int((x2 - x1) * args.padding)
-            xx1 = max(0, x1 - pad)
-            yy1 = max(0, y1 - pad)
-            xx2 = min(w, x2 + pad)
-            yy2 = min(h, y2 + pad)
-
-            roi = frame[yy1:yy2, xx1:xx2]
-            roi = cv2.GaussianBlur(roi, (99, 99), 30)
-            frame[yy1:yy2, xx1:xx2] = roi
+            blur = cv2.GaussianBlur(roi, BLUR_KERNEL, 0)
+            frame[y1:y2, x1:x2] = blur
 
     out.write(frame)
+    frame_idx += 1
 
+    if frame_idx % 50 == 0:
+        print(f"처리 중... {frame_idx} frames")
+
+# =====================
+# 정리
+# =====================
 cap.release()
 out.release()
-print("✅ 완료:", args.output)
+
+print("✅ 완료:", OUTPUT_VIDEO)
